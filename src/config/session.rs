@@ -24,6 +24,8 @@ pub struct Session {
     data_urls: HashMap<String, String>,
     #[serde(skip)]
     pub name: String,
+    #[serde(default)]
+    pub title: String,
     #[serde(skip)]
     pub path: Option<String>,
     #[serde(skip)]
