@@ -421,9 +421,11 @@ impl Config {
 
     pub fn session_info(&self) -> Result<String> {
         if let Some(session) = &self.session {
+            let session_title = format!("Session Title: {}\n", session.title);
             let render_options = self.get_render_options()?;
             let mut markdown_render = MarkdownRender::init(render_options)?;
-            session.render(&mut markdown_render)
+            let session_info = session.render(&mut markdown_render)?;
+            Ok(session_title + &session_info)
         } else {
             bail!("No session")
         }
