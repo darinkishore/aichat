@@ -6,6 +6,12 @@ use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
 use self::prompt::ReplPrompt;
 
+// Placeholder for the new function
+pub fn generate_session_title(session_content: &str) -> String {
+    // TODO: Interact with LLM provider
+    "Generated Title".to_string()
+}
+
 use crate::client::init_client;
 use crate::config::{GlobalConfig, Input, State};
 use crate::render::{render_error, render_stream};
@@ -229,7 +235,12 @@ impl Repl {
                         self.config.write().clear_role()?;
                     }
                     Some("session") => {
-                        self.config.write().end_session()?;
+                        {
+                            let suggested_title = client::generate_session_title(&self.config.read().unwrap().session.content);
+                            let mut session = self.config.write();
+                            session.session_mut().unwrap().name = suggested_title;
+                            session.end_session()?
+                        };
                     }
                     Some(_) => unknown_command()?,
                     None => {
