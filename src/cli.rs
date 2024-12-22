@@ -3,57 +3,77 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
-    /// Choose a LLM model
+    /// Select a LLM model
     #[clap(short, long)]
     pub model: Option<String>,
-    /// Choose a role
+    /// Use the system prompt
+    #[clap(long)]
+    pub prompt: Option<String>,
+    /// Select a role
     #[clap(short, long)]
     pub role: Option<String>,
-    /// Create or reuse a session
+    /// Start or join a session
     #[clap(short = 's', long)]
     pub session: Option<Option<String>>,
-    /// Attach files to the message to be sent.
-    #[clap(short = 'f', long, num_args = 1.., value_name = "FILE")]
-    pub file: Option<Vec<String>>,
-    /// Disable syntax highlighting
-    #[clap(short = 'H', long)]
-    pub no_highlight: bool,
-    /// No stream output
+    /// Ensure the session is empty
+    #[clap(long)]
+    pub empty_session: bool,
+    /// Ensure the new conversation is saved to the session
+    #[clap(long)]
+    pub save_session: bool,
+    /// Start a agent
+    #[clap(short = 'a', long)]
+    pub agent: Option<String>,
+    /// Set agent variables
+    #[clap(long, value_names = ["NAME", "VALUE"], num_args = 2)]
+    pub agent_variable: Vec<String>,
+    /// Start a RAG
+    #[clap(long)]
+    pub rag: Option<String>,
+    /// Serve the LLM API and WebAPP
+    #[clap(long, value_name = "ADDRESS")]
+    pub serve: Option<Option<String>>,
+    /// Execute commands in natural language
+    #[clap(short = 'e', long)]
+    pub execute: bool,
+    /// Output code only
+    #[clap(short = 'c', long)]
+    pub code: bool,
+    /// Include files with the message
+    #[clap(short = 'f', long, value_name = "FILE")]
+    pub file: Vec<String>,
+    /// Turn off stream mode
     #[clap(short = 'S', long)]
     pub no_stream: bool,
-    /// Specify the text-wrapping mode (no, auto, <max-width>)
-    #[clap(short = 'w', long)]
-    pub wrap: Option<String>,
-    /// Use light theme
-    #[clap(long)]
-    pub light_theme: bool,
-    /// Run in dry run mode
+    /// Display the message without sending it
     #[clap(long)]
     pub dry_run: bool,
-    /// Print related information
+    /// Display information
     #[clap(long)]
     pub info: bool,
-    /// List all available models
+    /// List all available chat models
     #[clap(long)]
     pub list_models: bool,
-    /// List all available roles
+    /// List all roles
     #[clap(long)]
     pub list_roles: bool,
-    /// List all available sessions
+    /// List all sessions
     #[clap(long)]
     pub list_sessions: bool,
+    /// List all agents
+    #[clap(long)]
+    pub list_agents: bool,
+    /// List all RAGs
+    #[clap(long)]
+    pub list_rags: bool,
     /// Input text
+    #[clap(trailing_var_arg = true)]
     text: Vec<String>,
 }
 
 impl Cli {
     pub fn text(&self) -> Option<String> {
-        let text = self
-            .text
-            .iter()
-            .map(|x| x.trim().to_string())
-            .collect::<Vec<String>>()
-            .join(" ");
+        let text = self.text.to_vec().join(" ");
         if text.is_empty() {
             return None;
         }

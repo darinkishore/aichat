@@ -1,228 +1,329 @@
-use super::{ErnieClient, Client, ExtraConfig, PromptType, SendData, Model, patch_system_message};
-
-use crate::{
-    config::GlobalConfig,
-    render::ReplyHandler,
-    utils::PromptKind,
-};
+use super::access_token::*;
+use super::openai_compatible::*;
+use super::*;
 
 use anyhow::{anyhow, bail, Context, Result};
-use async_trait::async_trait;
-use futures_util::StreamExt;
 use reqwest::{Client as ReqwestClient, RequestBuilder};
-use reqwest_eventsource::{Error as EventSourceError, Event, RequestBuilderExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::env;
 
 const API_BASE: &str = "https://aip.baidubce.com/rpc/2.0/ai_custom/v1";
 const ACCESS_TOKEN_URL: &str = "https://aip.baidubce.com/oauth/2.0/token";
-
-const MODELS: [(&str, &str); 4] = [
-    ("ernie-bot", "/wenxinworkshop/chat/completions"),
-    ("ernie-bot-4", "/wenxinworkshop/chat/completions_pro"),
-    ("ernie-bot-8k", "/wenxinworkshop/chat/ernie_bot_8k"),
-    ("ernie-bot-turbo", "/wenxinworkshop/chat/eb-instant"),
-];
-
-static mut ACCESS_TOKEN: String = String::new(); // safe under linear operation
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ErnieConfig {
     pub name: Option<String>,
     pub api_key: Option<String>,
     pub secret_key: Option<String>,
+    #[serde(default)]
+    pub models: Vec<ModelData>,
+    pub patch: Option<RequestPatch>,
     pub extra: Option<ExtraConfig>,
 }
 
-#[async_trait]
-impl Client for ErnieClient {
-    fn config(&self) -> (&GlobalConfig, &Option<ExtraConfig>) {
-        (&self.global_config, &self.config.extra)
-    }
-
-    async fn send_message_inner(&self, client: &ReqwestClient, data: SendData) -> Result<String> {
-        self.prepare_access_token().await?;
-        let builder = self.request_builder(client, data)?;
-        send_message(builder).await
-    }
-
-    async fn send_message_streaming_inner(
-        &self,
-        client: &ReqwestClient,
-        handler: &mut ReplyHandler,
-        data: SendData,
-    ) -> Result<()> {
-        self.prepare_access_token().await?;
-        let builder = self.request_builder(client, data)?;
-        send_message_streaming(builder, handler).await
-    }
-}
-
 impl ErnieClient {
-    pub const PROMPTS: [PromptType<'static>; 2] = [
+    config_get_fn!(api_key, get_api_key);
+    config_get_fn!(secret_key, get_secret_key);
+    pub const PROMPTS: [PromptAction<'static>; 2] = [
         ("api_key", "API Key:", true, PromptKind::String),
         ("secret_key", "Secret Key:", true, PromptKind::String),
     ];
+}
 
-    pub fn list_models(local_config: &ErnieConfig) -> Vec<Model> {
-        let client_name = Self::name(local_config);
-        MODELS
-            .into_iter()
-            .map(|(name, _)| Model::new(client_name, name))
-            .collect()
+#[async_trait::async_trait]
+impl Client for ErnieClient {
+    client_common_fns!();
+
+    async fn chat_completions_inner(
+        &self,
+        client: &ReqwestClient,
+        data: ChatCompletionsData,
+    ) -> Result<ChatCompletionsOutput> {
+        prepare_access_token(self, client).await?;
+        let request_data = prepare_chat_completions(self, data)?;
+        let builder = self.request_builder(client, request_data);
+        chat_completions(builder, &self.model).await
     }
 
-    fn request_builder(&self, client: &ReqwestClient, data: SendData) -> Result<RequestBuilder> {
-        let body = build_body(data, self.model.name.clone());
-
-        let model = self.model.name.clone();
-        let (_, chat_endpoint) = MODELS
-            .iter()
-            .find(|(v, _)| v == &model)
-            .ok_or_else(|| anyhow!("Miss Model '{}'", self.model.id()))?;
-
-        let url = format!("{API_BASE}{chat_endpoint}?access_token={}", unsafe {
-            &ACCESS_TOKEN
-        });
-
-        debug!("Ernie Request: {url} {body}");
-
-        let builder = client.post(url).json(&body);
-
-        Ok(builder)
+    async fn chat_completions_streaming_inner(
+        &self,
+        client: &ReqwestClient,
+        handler: &mut SseHandler,
+        data: ChatCompletionsData,
+    ) -> Result<()> {
+        prepare_access_token(self, client).await?;
+        let request_data = prepare_chat_completions(self, data)?;
+        let builder = self.request_builder(client, request_data);
+        chat_completions_streaming(builder, handler, &self.model).await
     }
 
-    async fn prepare_access_token(&self) -> Result<()> {
-        if unsafe { ACCESS_TOKEN.is_empty() } {
-            // Note: cannot use config_get_fn!
-            let env_prefix = Self::name(&self.config).to_uppercase();
-            let api_key = self.config.api_key.clone();
-            let api_key = api_key
-                .or_else(|| env::var(format!("{env_prefix}_API_KEY")).ok())
-                .ok_or_else(|| anyhow!("Miss api_key"))?;
+    async fn embeddings_inner(
+        &self,
+        client: &ReqwestClient,
+        data: &EmbeddingsData,
+    ) -> Result<EmbeddingsOutput> {
+        prepare_access_token(self, client).await?;
+        let request_data = prepare_embeddings(self, data)?;
+        let builder = self.request_builder(client, request_data);
+        embeddings(builder, &self.model).await
+    }
 
-            let secret_key = self.config.secret_key.clone();
-            let secret_key = secret_key
-                .or_else(|| env::var(format!("{env_prefix}_SECRET_KEY")).ok())
-                .ok_or_else(|| anyhow!("Miss secret_key"))?;
-
-            let token = fetch_access_token(&api_key, &secret_key)
-                .await
-                .with_context(|| "Failed to fetch access token")?;
-            unsafe { ACCESS_TOKEN = token };
-        }
-        Ok(())
+    async fn rerank_inner(
+        &self,
+        client: &ReqwestClient,
+        data: &RerankData,
+    ) -> Result<RerankOutput> {
+        prepare_access_token(self, client).await?;
+        let request_data = prepare_rerank(self, data)?;
+        let builder = self.request_builder(client, request_data);
+        rerank(builder, &self.model).await
     }
 }
 
-async fn send_message(builder: RequestBuilder) -> Result<String> {
-    let data: Value = builder.send().await?.json().await?;
-    check_error(&data)?;
+fn prepare_chat_completions(self_: &ErnieClient, data: ChatCompletionsData) -> Result<RequestData> {
+    let access_token = get_access_token(self_.name())?;
 
-    let output = data["result"]
-        .as_str()
-        .ok_or_else(|| anyhow!("Unexpected response {data}"))?;
+    let url = format!(
+        "{API_BASE}/wenxinworkshop/chat/{}?access_token={access_token}",
+        self_.model.name(),
+    );
 
-    Ok(output.to_string())
+    let body = build_chat_completions_body(data, &self_.model);
+
+    let request_data = RequestData::new(url, body);
+
+    Ok(request_data)
 }
 
-async fn send_message_streaming(
+fn prepare_embeddings(self_: &ErnieClient, data: &EmbeddingsData) -> Result<RequestData> {
+    let access_token = get_access_token(self_.name())?;
+
+    let url = format!(
+        "{API_BASE}/wenxinworkshop/embeddings/{}?access_token={access_token}",
+        self_.model.name(),
+    );
+
+    let body = json!({
+        "input": data.texts,
+    });
+
+    let request_data = RequestData::new(url, body);
+
+    Ok(request_data)
+}
+
+fn prepare_rerank(self_: &ErnieClient, data: &RerankData) -> Result<RequestData> {
+    let access_token = get_access_token(self_.name())?;
+
+    let url = format!(
+        "{API_BASE}/wenxinworkshop/reranker/{}?access_token={access_token}",
+        self_.model.name(),
+    );
+
+    let RerankData {
+        query,
+        documents,
+        top_n,
+    } = data;
+
+    let body = json!({
+        "query": query,
+        "documents": documents,
+        "top_n": top_n
+    });
+
+    let request_data = RequestData::new(url, body);
+
+    Ok(request_data)
+}
+
+async fn prepare_access_token(self_: &ErnieClient, client: &ReqwestClient) -> Result<()> {
+    let client_name = self_.name();
+    if !is_valid_access_token(client_name) {
+        let api_key = self_.get_api_key()?;
+        let secret_key = self_.get_secret_key()?;
+
+        let token = fetch_access_token(client, &api_key, &secret_key)
+            .await
+            .with_context(|| "Failed to fetch access token")?;
+        set_access_token(client_name, token, 86400);
+    }
+    Ok(())
+}
+
+async fn chat_completions(
     builder: RequestBuilder,
-    handler: &mut ReplyHandler,
+    _model: &Model,
+) -> Result<ChatCompletionsOutput> {
+    let data: Value = builder.send().await?.json().await?;
+    maybe_catch_error(&data)?;
+    debug!("non-stream-data: {data}");
+    extract_chat_completions_text(&data)
+}
+
+async fn chat_completions_streaming(
+    builder: RequestBuilder,
+    handler: &mut SseHandler,
+    _model: &Model,
 ) -> Result<()> {
-    let mut es = builder.eventsource()?;
-    while let Some(event) = es.next().await {
-        match event {
-            Ok(Event::Open) => {}
-            Ok(Event::Message(message)) => {
-                let data: Value = serde_json::from_str(&message.data)?;
-                if let Some(text) = data["result"].as_str() {
-                    handler.text(text)?;
-                }
+    let handle = |message: SseMmessage| -> Result<bool> {
+        let data: Value = serde_json::from_str(&message.data)?;
+        debug!("stream-data: {data}");
+        if let Some(function) = data["function_call"].as_object() {
+            if let (Some(name), Some(arguments)) = (
+                function.get("name").and_then(|v| v.as_str()),
+                function.get("arguments").and_then(|v| v.as_str()),
+            ) {
+                let arguments: Value = arguments.parse().with_context(|| {
+                    format!("Tool call '{name}' have non-JSON arguments '{arguments}'")
+                })?;
+                handler.tool_call(ToolCall::new(name.to_string(), arguments, None))?;
             }
-            Err(err) => {
-                match err {
-                    EventSourceError::InvalidContentType(header_value, res) => {
-                        let content_type = header_value
-                            .to_str()
-                            .map_err(|_| anyhow!("Invalid response header"))?;
-                        if content_type.contains("application/json") {
-                            let data: Value = res.json().await?;
-                            check_error(&data)?;
-                            bail!("Request failed");
-                        } else {
-                            let text = res.text().await?;
-                            if let Some(text) = text.strip_prefix("data: ") {
-                                let data: Value = serde_json::from_str(text)?;
-                                if let Some(text) = data["result"].as_str() {
-                                    handler.text(text)?;
-                                }
-                            } else {
-                                bail!("Invalid response data: {text}")
-                            }
-                        }
-                    }
-                    EventSourceError::StreamEnded => {}
-                    _ => {
-                        bail!("{}", err);
-                    }
-                }
-                es.close();
-            }
+        } else if let Some(text) = data["result"].as_str() {
+            handler.text(text)?;
         }
-    }
+        Ok(false)
+    };
 
-    Ok(())
+    sse_stream(builder, handle).await
 }
 
-fn check_error(data: &Value) -> Result<()> {
-    if let Some(err_msg) = data["error_msg"].as_str() {
-        if let Some(code) = data["error_code"].as_number().and_then(|v| v.as_u64()) {
-            if code == 110 {
-                unsafe { ACCESS_TOKEN = String::new() }
-            }
-            bail!("{err_msg}. err_code: {code}");
-        } else {
-            bail!("{err_msg}");
-        }
-    }
-    Ok(())
+async fn embeddings(builder: RequestBuilder, _model: &Model) -> Result<EmbeddingsOutput> {
+    let data: Value = builder.send().await?.json().await?;
+    maybe_catch_error(&data)?;
+    let res_body: EmbeddingsResBody =
+        serde_json::from_value(data).context("Invalid embeddings data")?;
+    let output = res_body.data.into_iter().map(|v| v.embedding).collect();
+    Ok(output)
 }
 
-fn build_body(data: SendData, _model: String) -> Value {
-    let SendData {
+#[derive(Deserialize)]
+struct EmbeddingsResBody {
+    data: Vec<EmbeddingsResBodyEmbedding>,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingsResBodyEmbedding {
+    embedding: Vec<f32>,
+}
+
+async fn rerank(builder: RequestBuilder, _model: &Model) -> Result<RerankOutput> {
+    let data: Value = builder.send().await?.json().await?;
+    maybe_catch_error(&data)?;
+    let res_body: GenericRerankResBody =
+        serde_json::from_value(data).context("Invalid rerank data")?;
+    Ok(res_body.results)
+}
+
+fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Value {
+    let ChatCompletionsData {
         mut messages,
         temperature,
+        top_p,
+        functions,
         stream,
     } = data;
 
-    patch_system_message(&mut messages);
+    let system_message = extract_system_message(&mut messages);
+
+    let messages: Vec<Value> = messages
+        .into_iter()
+        .flat_map(|message| {
+            let Message { role, content } = message;
+            match content {
+                MessageContent::ToolCalls(MessageContentToolCalls {
+                    tool_results,  ..
+                }) => {
+                    let mut list = vec![];
+                    for tool_result in tool_results {
+                        list.push(json!({
+                            "role": "assistant",
+                            "content": format!("Action: {}\nAction Input: {}", tool_result.call.name, tool_result.call.arguments)
+                        }));
+                        list.push(json!({
+                            "role": "user",
+                            "content": tool_result.output.to_string(),
+                        }))
+
+                    }
+                    list
+                }
+                _ => vec![json!({ "role": role, "content": content })],
+            }
+        })
+        .collect();
 
     let mut body = json!({
         "messages": messages,
     });
 
-    if let Some(temperature) = temperature {
-        body["temperature"] = (temperature / 2.0).into();
+    if let Some(v) = system_message {
+        body["system"] = v.into();
     }
+
+    if let Some(v) = model.max_tokens_param() {
+        body["max_output_tokens"] = v.into();
+    }
+    if let Some(v) = temperature {
+        body["temperature"] = v.into();
+    }
+    if let Some(v) = top_p {
+        body["top_p"] = v.into();
+    }
+
     if stream {
         body["stream"] = true.into();
+    }
+
+    if let Some(functions) = functions {
+        body["functions"] = json!(functions);
     }
 
     body
 }
 
-async fn fetch_access_token(api_key: &str, secret_key: &str) -> Result<String> {
+fn extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsOutput> {
+    let text = data["result"].as_str().unwrap_or_default();
+
+    let mut tool_calls = vec![];
+    if let Some(call) = data["function_call"].as_object() {
+        if let (Some(name), Some(arguments)) = (
+            call.get("name").and_then(|v| v.as_str()),
+            call.get("arguments").and_then(|v| v.as_str()),
+        ) {
+            let arguments: Value = arguments.parse().with_context(|| {
+                format!("Tool call '{name}' have non-JSON arguments '{arguments}'")
+            })?;
+            tool_calls.push(ToolCall::new(name.to_string(), arguments, None));
+        }
+    }
+
+    if text.is_empty() && tool_calls.is_empty() {
+        bail!("Invalid response data: {data}");
+    }
+    let output = ChatCompletionsOutput {
+        text: text.to_string(),
+        tool_calls,
+        id: data["id"].as_str().map(|v| v.to_string()),
+        input_tokens: data["usage"]["prompt_tokens"].as_u64(),
+        output_tokens: data["usage"]["completion_tokens"].as_u64(),
+    };
+    Ok(output)
+}
+
+async fn fetch_access_token(
+    client: &reqwest::Client,
+    api_key: &str,
+    secret_key: &str,
+) -> Result<String> {
     let url = format!("{ACCESS_TOKEN_URL}?grant_type=client_credentials&client_id={api_key}&client_secret={secret_key}");
-    let value: Value = reqwest::get(&url).await?.json().await?;
-    let result = value["access_token"].as_str()
-        .ok_or_else(|| {
-            if let Some(err_msg) = value["error_description"].as_str() {
-                anyhow!("{err_msg}")
-            } else {
-                anyhow!("Invalid response data")
-            }
-        })?;
+    let value: Value = client.get(&url).send().await?.json().await?;
+    let result = value["access_token"].as_str().ok_or_else(|| {
+        if let Some(err_msg) = value["error_description"].as_str() {
+            anyhow!("{err_msg}")
+        } else {
+            anyhow!("Invalid response data")
+        }
+    })?;
     Ok(result.to_string())
 }

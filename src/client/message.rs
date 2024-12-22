@@ -1,4 +1,4 @@
-use crate::config::Input;
+use crate::{function::ToolResult, utils::dimmed_text};
 
 use serde::{Deserialize, Serialize};
 
@@ -8,21 +8,52 @@ pub struct Message {
     pub content: MessageContent,
 }
 
-impl Message {
-    pub fn new(input: &Input) -> Self {
+impl Default for Message {
+    fn default() -> Self {
         Self {
             role: MessageRole::User,
-            content: input.to_message_content(),
+            content: MessageContent::Text(String::new()),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+impl Message {
+    pub fn new(role: MessageRole, content: MessageContent) -> Self {
+        Self { role, content }
+    }
+
+    pub fn merge_system(&mut self, system: &str) {
+        match &mut self.content {
+            MessageContent::Text(text) => {
+                self.content = MessageContent::Array(vec![
+                    MessageContentPart::Text {
+                        text: system.to_string(),
+                    },
+                    MessageContentPart::Text {
+                        text: text.to_string(),
+                    },
+                ]);
+            }
+            MessageContent::Array(list) => {
+                list.insert(
+                    0,
+                    MessageContentPart::Text {
+                        text: system.to_string(),
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
     System,
     Assistant,
     User,
+    Tool,
 }
 
 #[allow(dead_code)]
@@ -34,10 +65,6 @@ impl MessageRole {
     pub fn is_user(&self) -> bool {
         matches!(self, MessageRole::User)
     }
-
-    pub fn is_assistant(&self) -> bool {
-        matches!(self, MessageRole::Assistant)
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -45,10 +72,16 @@ impl MessageRole {
 pub enum MessageContent {
     Text(String),
     Array(Vec<MessageContentPart>),
+    // Note: This type is primarily for convenience and does not exist in OpenAI's API.
+    ToolCalls(MessageContentToolCalls),
 }
 
 impl MessageContent {
-    pub fn render_input(&self, resolve_url_fn: impl Fn(&str) -> String) -> String {
+    pub fn render_input(
+        &self,
+        resolve_url_fn: impl Fn(&str) -> String,
+        agent_info: &Option<(String, Vec<String>)>,
+    ) -> String {
         match self {
             MessageContent::Text(text) => text.to_string(),
             MessageContent::Array(list) => {
@@ -68,6 +101,26 @@ impl MessageContent {
                 }
                 format!(".file {}{}", files.join(" "), concated_text)
             }
+            MessageContent::ToolCalls(MessageContentToolCalls {
+                tool_results, text, ..
+            }) => {
+                let mut lines = vec![];
+                if !text.is_empty() {
+                    lines.push(text.clone())
+                }
+                for tool_result in tool_results {
+                    let mut parts = vec!["Call".to_string()];
+                    if let Some((agent_name, functions)) = agent_info {
+                        if functions.contains(&tool_result.call.name) {
+                            parts.push(agent_name.clone())
+                        }
+                    }
+                    parts.push(tool_result.call.name.clone());
+                    parts.push(tool_result.call.arguments.to_string());
+                    lines.push(dimmed_text(&parts.join(" ")));
+                }
+                lines.join("\n")
+            }
         }
     }
 
@@ -83,6 +136,23 @@ impl MessageContent {
                     *text = replace_fn(text)
                 }
             }
+            MessageContent::ToolCalls(_) => {}
+        }
+    }
+
+    pub fn to_text(&self) -> String {
+        match self {
+            MessageContent::Text(text) => text.to_string(),
+            MessageContent::Array(list) => {
+                let mut parts = vec![];
+                for item in list {
+                    if let MessageContentPart::Text { text } = item {
+                        parts.push(text.clone())
+                    }
+                }
+                parts.join("\n\n")
+            }
+            MessageContent::ToolCalls(_) => String::new(),
         }
     }
 }
@@ -99,15 +169,44 @@ pub struct ImageUrl {
     pub url: String,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MessageContentToolCalls {
+    pub tool_results: Vec<ToolResult>,
+    pub text: String,
+    pub sequence: bool,
+}
 
-    #[test]
-    fn test_serde() {
-        assert_eq!(
-            serde_json::to_string(&Message::new(&Input::from_str("Hello World"))).unwrap(),
-            "{\"role\":\"user\",\"content\":\"Hello World\"}"
-        );
+impl MessageContentToolCalls {
+    pub fn new(tool_results: Vec<ToolResult>, text: String) -> Self {
+        Self {
+            tool_results,
+            text,
+            sequence: false,
+        }
     }
+
+    pub fn merge(&mut self, tool_results: Vec<ToolResult>, _text: String) {
+        self.tool_results.extend(tool_results);
+        self.text.clear();
+        self.sequence = true;
+    }
+}
+
+pub fn patch_system_message(messages: &mut Vec<Message>) {
+    if messages[0].role.is_system() {
+        let system_message = messages.remove(0);
+        if let (Some(message), MessageContent::Text(system)) =
+            (messages.get_mut(0), system_message.content)
+        {
+            message.merge_system(&system);
+        }
+    }
+}
+
+pub fn extract_system_message(messages: &mut Vec<Message>) -> Option<String> {
+    if messages[0].role.is_system() {
+        let system_message = messages.remove(0);
+        return Some(system_message.content.to_text());
+    }
+    None
 }
